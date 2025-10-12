@@ -1,0 +1,364 @@
+import express, { Request, Response } from "express";
+import cors from "cors";
+import { v4 as uuidv4 } from "uuid";
+import { Ollama } from "ollama"; // Ollama JS client
+import fs from "fs";
+import path from "path";
+
+// --------------------------
+// Setup
+// --------------------------
+const app = express();
+const port = 3001;
+
+app.use(express.json());
+app.use(
+  cors({
+    origin: "*", // or ["http://localhost:3000"]
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+const MAX_HISTORY = 20;
+
+// --------------------------
+// Types
+// --------------------------
+interface Message {
+  role: string;
+  content: string;
+}
+
+interface ChatRequest {
+  message: string;
+  history?: Message[];
+  system_message?: string;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+}
+
+// --------------------------
+// State
+// --------------------------
+const chatHistories: Map<string, Message[]> = new Map();
+const ollama = new Ollama();
+
+// --------------------------
+// Routes
+// --------------------------
+
+// Streaming Chat Endpoint
+app.put("/chat/:chatID", async (req: Request, res: Response) => {
+  const chatID = req.params.chatID;
+
+  console.log(`Got signal from chat with ID: ${chatID}`);
+
+  // Init history
+  if (!chatHistories.has(chatID)) {
+    chatHistories.set(chatID, []);
+  }
+
+  const body: ChatRequest = req.body;
+  const history = chatHistories.get(chatID)!;
+
+  history.push({ role: "user", content: body.message });
+  if (history.length > MAX_HISTORY) {
+    chatHistories.set(chatID, history.slice(-MAX_HISTORY));
+  }
+
+  const messages: Message[] = [
+    {
+      role: "system",
+      content:
+        body.system_message || "You are a friendly Chatbot that is named DTT.",
+    },
+    ...history,
+  ];
+
+  // Streaming headers
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Transfer-Encoding", "chunked");
+
+  try {
+    let fullReply = "";
+
+    const stream = await ollama.chat({
+      model: "phi",
+      messages,
+      stream: true,
+      options: {
+        temperature: body.temperature ?? 0.7,
+        top_p: body.top_p ?? 0.95,
+        num_predict: body.max_tokens ?? 512,
+      },
+    });
+
+    for await (const chunk of stream) {
+      const token = chunk.message?.content || "";
+      fullReply += token;
+      res.write(token);
+    }
+
+    // Save assistant reply
+    history.push({ role: "assistant", content: fullReply });
+    res.end();
+  } catch (e: any) {
+    res.write(`\n[Error: ${e.message}]`);
+    res.end();
+  }
+});
+
+// Health check
+app.get("/", (_req: Request, res: Response) => {
+  res.json({ status: "Server is running!" });
+});
+
+// Favicon
+app.get("/favicon.ico", (_req: Request, res: Response) => {
+  const file = path.join(__dirname, "favicon.ico");
+  if (fs.existsSync(file)) {
+    res.sendFile(file);
+  } else {
+    res.status(404).end();
+  }
+});
+
+// --------------------------
+// Start
+// --------------------------
+app.listen(port, () => {
+  console.log(`🚀 Server running on http://localhost:${port}`);
+});
+
+import express, { Request, Response, NextFunction } from "express";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { v4 as uuidv4 } from "uuid";
+import {
+  getUserByUsername,
+  comparePassword,
+  createToken,
+  verifyToken,
+  publicUser,
+  hashPassword,
+  insertUser,
+  insertUserPassword,
+  getUserById,
+  getChatById,
+  getChatsForUser,
+  createChat,
+  insertUserMessage,
+  updateChatLastUpdate,
+} from "./helpers";
+
+// Extend Express Request to include userId for authenticated routes
+interface AuthenticatedRequest extends Request {
+  userId?: string;
+}
+
+// Request body types
+interface RegisterBody {
+  email: string;
+  username: string;
+  name?: string;
+  password: string;
+  retypedPassword: string;
+}
+
+interface LoginBody {
+  username: string;
+  password: string;
+}
+
+interface CreateChatBody {
+  name: string;
+  members?: string[];
+  type: "direct" | "group" | "bot";
+}
+
+interface SendMessageBody {
+  chatId: string;
+  text: string;
+}
+
+// Initialize Express app
+const app = express();
+
+// ===== Middleware =====
+app.use(cors());
+app.use(express.json());
+
+// Rate limiting middleware
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 30,
+    message: { error: "Too many requests, slow down!" },
+  })
+);
+
+// Authentication middleware
+const auth = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: "Missing token" });
+
+  const token = header.split(" ")[1];
+  const userId = verifyToken(token);
+  if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+  req.userId = userId;
+  next();
+};
+
+// ===== Routes =====
+
+// --- Register ---
+app.post("/api/register", async (req: Request<{}, {}, RegisterBody>, res: Response) => {
+  const { email, username, name, password, retypedPassword } = req.body;
+
+  // Validate required fields
+  if (!username || !password || !retypedPassword)
+    return res.status(400).json({ error: "Missing required fields" });
+
+  // Validate email format
+  const emailRegex = /^[\w.-]+@([\w-]+\.)+[\w-]{2,4}$/;
+  if (!emailRegex.test(email))
+    return res.status(400).json({ error: "Invalid email address" });
+
+  // Validate password match
+  if (password !== retypedPassword)
+    return res.status(400).json({ error: "Passwords do not match" });
+
+  // Validate username
+  const usernameRegex =
+    /^(?=.{3,20}$)(?![_.-])(?!.*[_.-]{2})[a-zA-Z0-9._-]+(?<![_.-])$/;
+  if (!usernameRegex.test(username))
+    return res.status(400).json({ error: "Invalid username" });
+
+  try {
+    const existingUser = await getUserByUsername(username);
+    if (existingUser)
+      return res.status(409).json({ error: "Username already exists" });
+
+    const hashedPassword = await hashPassword(password);
+    const id = uuidv4();
+
+    await insertUser({ id, username, name });
+    await insertUserPassword({ userId: id, hashedPassword, email });
+
+    const token = createToken(id);
+
+    res.status(201).json({
+      user: { id, username, name: name || username, status: "online" },
+      token,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Registration failed" });
+  }
+});
+
+// --- Login ---
+app.post("/api/login", async (req: Request<{}, {}, LoginBody>, res: Response) => {
+  const { username, password } = req.body;
+
+  if (!username || !password)
+    return res.status(400).json({ error: "Missing required fields" });
+
+  try {
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.hashedPassword) return res.status(400).json({ error: "Forbidden" });
+
+    const valid = await comparePassword(password, user.hashedPassword);
+    if (!valid) return res.status(401).json({ error: "Invalid password" });
+
+    const token = createToken(user.id);
+    res.status(200).json({ user: publicUser(user), token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// --- Get user profile ---
+app.get("/api/user/:id", auth, async (req: AuthenticatedRequest, res: Response) => {
+  const userId = req.params.id;
+  if (userId !== req.userId) return res.status(403).json({ error: "Forbidden" });
+
+  try {
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(publicUser(user));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+// --- Get chats for user ---
+app.get("/api/chats/:userId", auth, async (req: AuthenticatedRequest, res: Response) => {
+  const userId = req.params.userId;
+  if (userId !== req.userId) return res.status(403).json({ error: "Forbidden" });
+
+  try {
+    const chats = await getChatsForUser(userId);
+    res.json(chats);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch chats" });
+  }
+});
+
+// --- Create a chat ---
+app.post("/api/chats", auth, async (req: AuthenticatedRequest, res: Response) => {
+  const { name, members = [], type } = req.body as CreateChatBody;
+  const creatorId = req.userId!;
+  if (!members.includes(creatorId)) members.push(creatorId);
+
+  const chatId = uuidv4();
+  try {
+    await createChat({ chatId, name, type, members });
+    res.json({ id: chatId, name, type, members });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
+// --- Send a message ---
+app.post("/api/messages", auth, async (req: AuthenticatedRequest, res: Response) => {
+  const { chatId, text } = req.body as SendMessageBody;
+  const senderId = req.userId!;
+
+  try {
+    const chat = await getChatById(chatId);
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+
+    const sender = await getUserById(senderId);
+    if (!sender) return res.status(404).json({ error: "Sender not found" });
+
+    const messageId = uuidv4();
+    await insertUserMessage(chatId, messageId, senderId, sender.name, text);
+    await updateChatLastUpdate({ chatId });
+
+    res.json({ id: messageId, chatId, senderId, text });
+
+    if (chat.type === "bot") console.log("Bot chat placeholder triggered");
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// ===== Server =====
+if (require.main === module) {
+  app.listen(3000, () => {
+    console.log("Chat API running on http://localhost:3000");
+  });
+}
+
+export default app;

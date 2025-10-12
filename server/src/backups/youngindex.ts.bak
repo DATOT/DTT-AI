@@ -1,0 +1,219 @@
+import express, { Request, Response, NextFunction } from "express";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { v4 as uuidv4 } from "uuid";
+import {
+  getUserByUsername,
+  comparePassword,
+  createToken,
+  verifyToken,
+  publicUser,
+  hashPassword,
+  insertUser,
+  insertUserPassword,
+  getUserById,
+  getChatById,
+  getChatsForUser,
+  createChat,
+  insertUserMessage,
+  updateChatLastUpdate,
+} from "./helpers";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,
+  message: { error: "Too many requests, slow down!" },
+});
+app.use(limiter);
+
+function auth(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: "Missing token" });
+
+  const token = header.split(" ")[1];
+  const userId = verifyToken(token);
+  if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+  (req as any).userId = userId;
+  next();
+}
+
+// Register
+app.post("/api/register", async (req: Request, res: Response) => {
+  const { email, username, name, password, retypedPassword } = req.body as {
+    email: string;
+    username: string;
+    name?: string;
+    password: string;
+    retypedPassword: string;
+  };
+
+  if (!username || !password || !retypedPassword)
+    return res.status(400).json({ error: "Missing required fields" });
+
+  const emailRegex = /^[\w.-]+@([\w-]+\.)+[\w-]{2,4}$/;
+  if (!emailRegex.test(email))
+    return res.status(400).json({ error: "Invalid email address" });
+
+  if (password !== retypedPassword)
+    return res.status(400).json({ error: "Passwords do not match" });
+
+  const usernameRegex =
+    /^(?=.{3,20}$)(?![_.-])(?!.*[_.-]{2})[a-zA-Z0-9._-]+(?<![_.-])$/;
+  if (!usernameRegex.test(username))
+    return res.status(400).json({ error: "Invalid username" });
+
+  try {
+    const existingUser = await getUserByUsername(username);
+    if (existingUser !== null)
+      return res.status(409).json({ error: "Username already exists" });
+
+    const hashedPassword: string = await hashPassword(password);
+
+    const id: string = uuidv4();
+
+    await insertUser({ id: id, username: username, name: name });
+    const userPass = await insertUserPassword({
+      userId: id,
+      hashedPassword: hashedPassword,
+      email: email,
+    });
+
+    const token = createToken(id);
+    res.status(201).json({
+      user: { id, username, name: name || username, status: "online" },
+      token,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Registration failed" });
+  }
+});
+
+// Login
+app.post("/api/login", async (req: Request, res: Response) => {
+  const { username, password } = req.body as {
+    username: string;
+    password: string;
+  };
+  if (!username || !password)
+    return res.status(400).json({ error: "Missing required fields" });
+
+  try {
+    const user = await getUserByUsername(username);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.hashedPassword) return res.status(400).json({ error: "Forbidden" });
+
+    const valid = await comparePassword(password, user.hashedPassword);
+    if (!valid) return res.status(401).json({ error: "Invalid password" });
+
+    const token = createToken(user.id);
+    return res.status(200).json({ user: publicUser(user), token });
+  } catch (err) {
+    console.error(err);
+    return res.status(500);
+  }
+});
+
+// Auth-protected routes
+app.get("/api/user/:id", auth, async (req: Request, res: Response) => {
+  const userId = req.params.id;
+  if (userId !== (req as any).userId)
+    return res.status(403).json({ error: "Forbidden" });
+
+  try {
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(publicUser(user));
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.get("/api/chats/:userId", auth, async (req: Request, res: Response) => {
+  const userId = req.params.userId;
+  if (userId !== (req as any).userId)
+    return res.status(403).json({ error: "Forbidden" });
+
+  try {
+    const result = await getChatsForUser(userId);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch chats" });
+  }
+});
+
+app.post("/api/chats", auth, async (req: Request, res: Response) => {
+  const { name, members = [], type } = req.body; // type: 'direct' | 'group' | 'bot'
+  const creatorId = (req as any).userId;
+
+  if (!members.includes(creatorId)) {
+    members.push(creatorId);
+  }
+
+  const chatId = uuidv4();
+  try {
+    await createChat({
+      chatId: chatId,
+      name: name,
+      type: type,
+      members: members,
+    });
+
+    res.json({ id: chatId, name, type, members });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create chat" });
+  }
+});
+
+app.post("/api/messages", auth, async (req: Request, res: Response) => {
+  const { chatId, text } = req.body;
+  const senderId = (req as any).userId;
+
+  try {
+    // Check if chat exists and get its type
+    const chat = await getChatById(chatId);
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+
+    const chatType = chat.type;
+
+    // Get sender name
+    const sender = await getUserById(senderId);
+    if (!sender) return res.status(404).json({ error: "Sender not found" });
+
+    const messageId = uuidv4();
+
+    // Insert user message
+    await insertUserMessage(chatId, messageId, senderId, sender.name, text);
+
+    // Update chat's last_updated
+    await updateChatLastUpdate({ chatId: chatId });
+
+    res.json({ id: messageId, chatId, senderId, text });
+
+    // If this is a bot chat, you can trigger streaming response asynchronously
+    if (chatType === "bot") {
+      console.log("meow:3");
+      // placeholder
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+if (require.main === module) {
+  app.listen(3000, () => {
+    console.log("Chat API running on http://localhost:3000");
+  });
+}
+
+export default app;
