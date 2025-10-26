@@ -1,6 +1,6 @@
 import bcrypt from "bcrypt";
 import { pool } from "./db";
-import { User } from "../../../shared/lib/types/index";
+import { User } from "@shared/lib/types/index";
 
 export interface PrivateUser extends User {
   hashedPassword: string;

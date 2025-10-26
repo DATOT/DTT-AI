@@ -30,6 +30,7 @@ router.post("/register", async (req: Request<{}, {}, RegisterBody>, res: Respons
 
   try {
     const existingUser = await getUserByUsername(username);
+    console.log(existingUser);
     if (existingUser) return res.status(409).json({ error: "Username already exists" });
 
     const hashedPassword = await hashPassword(password);
