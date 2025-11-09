@@ -18,3 +18,4 @@ export interface UserChat extends ChatBase {
 export interface BotChat extends ChatBase {
   type: ChatType.Bot;
 }
+
